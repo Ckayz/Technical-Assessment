@@ -2,24 +2,26 @@
 
 import { useDashboardStore } from '@/lib/store';
 import { formatCurrency } from '@/lib/math';
-import { useEffect } from 'react';
+import { useMemo } from 'react';
 
 export default function AgentTable() {
   const agentPositions = useDashboardStore((state) => state.agentPositions);
   const marketData = useDashboardStore((state) => state.marketData);
-  const updateAgentPnL = useDashboardStore((state) => state.updateAgentPnL);
 
-  // Update P&L when market data changes
-  useEffect(() => {
-    agentPositions.forEach((position) => {
+  // Calculate P&L on the fly without updating store
+  const positionsWithPnL = useMemo(() => {
+    return agentPositions.map((position) => {
       const market = marketData[position.symbol];
+      let pnl = 0;
+
       if (market) {
         const priceDiff = market.price - position.entryPrice;
-        const pnl = (priceDiff / position.entryPrice) * position.size * position.leverage * 100;
-        updateAgentPnL(position.id, parseFloat(pnl.toFixed(2)));
+        pnl = parseFloat(((priceDiff / position.entryPrice) * position.size * position.leverage * 100).toFixed(2));
       }
+
+      return { ...position, pnl };
     });
-  }, [marketData, agentPositions, updateAgentPnL]);
+  }, [agentPositions, marketData]);
 
   if (agentPositions.length === 0) {
     return (
@@ -63,7 +65,7 @@ export default function AgentTable() {
             </tr>
           </thead>
           <tbody>
-            {agentPositions.map((position) => (
+            {positionsWithPnL.map((position) => (
               <tr
                 key={position.id}
                 className="border-b border-gray-100 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors"
@@ -82,13 +84,13 @@ export default function AgentTable() {
                 </td>
                 <td
                   className={`py-3 px-4 text-right font-semibold ${
-                    (position.pnl ?? 0) >= 0
+                    position.pnl >= 0
                       ? 'text-green-600 dark:text-green-400'
                       : 'text-red-600 dark:text-red-400'
                   }`}
                 >
-                  {(position.pnl ?? 0) >= 0 ? '+' : ''}
-                  {formatCurrency(position.pnl ?? 0)}
+                  {position.pnl >= 0 ? '+' : ''}
+                  {formatCurrency(position.pnl)}
                 </td>
               </tr>
             ))}
@@ -98,7 +100,7 @@ export default function AgentTable() {
 
       {/* Mobile Card View */}
       <div className="md:hidden space-y-4">
-        {agentPositions.map((position) => (
+        {positionsWithPnL.map((position) => (
           <div
             key={position.id}
             className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-4 space-y-2"
@@ -109,13 +111,13 @@ export default function AgentTable() {
               </span>
               <span
                 className={`font-semibold ${
-                  (position.pnl ?? 0) >= 0
+                  position.pnl >= 0
                     ? 'text-green-600 dark:text-green-400'
                     : 'text-red-600 dark:text-red-400'
                 }`}
               >
-                {(position.pnl ?? 0) >= 0 ? '+' : ''}
-                {formatCurrency(position.pnl ?? 0)}
+                {position.pnl >= 0 ? '+' : ''}
+                {formatCurrency(position.pnl)}
               </span>
             </div>
             <div className="grid grid-cols-3 gap-2 text-sm">

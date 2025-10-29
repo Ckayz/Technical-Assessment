@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect } from 'react';
-import { useDashboardStore, MarketData } from '@/lib/store';
-import { createMockWebSocketClient } from '@/lib/websocket';
+import { useEffect, useRef } from 'react';
+import { useDashboardStore } from '@/lib/store';
+import { createConnectionManager, ConnectionManager } from '@/lib/connectionManager';
 import MarketTicker from '@/components/MarketTicker';
 import AgentTable from '@/components/AgentTable';
 import ConnectionBadge from '@/components/ConnectionBadge';
@@ -50,32 +50,57 @@ export default function Dashboard() {
   const updateMarketData = useDashboardStore((state) => state.updateMarketData);
   const setConnectionStatus = useDashboardStore((state) => state.setConnectionStatus);
   const setAgentPositions = useDashboardStore((state) => state.setAgentPositions);
+  const setReconnectAttempt = useDashboardStore((state) => state.setReconnectAttempt);
+  const setIsFakeData = useDashboardStore((state) => state.setIsFakeData);
+  const setConnectionError = useDashboardStore((state) => state.setConnectionError);
+
+  const connectionManagerRef = useRef<ConnectionManager | null>(null);
 
   useEffect(() => {
     // Initialize agent positions
     setAgentPositions(mockPositions);
 
-    // Create WebSocket client
-    const wsClient = createMockWebSocketClient();
-
-    // Set up message handler
-    wsClient.onMessage((data) => {
-      updateMarketData(data as unknown as MarketData);
+    // Create connection manager
+    const manager = createConnectionManager({
+      onMarketData: (data) => {
+        updateMarketData(data);
+      },
+      onStatusChange: (status) => {
+        setConnectionStatus(status);
+      },
+      onReconnectAttempt: (attempt) => {
+        setReconnectAttempt(attempt);
+      },
+      onFallbackToMock: () => {
+        console.log('[Dashboard] Switched to mock data mode');
+        setIsFakeData(true);
+      },
+      onError: (error) => {
+        console.error('[Dashboard] Connection error:', error);
+        setConnectionError(error);
+      },
     });
 
-    // Set up status change handler
-    wsClient.onStatusChange((status) => {
-      setConnectionStatus(status);
-    });
+    connectionManagerRef.current = manager;
 
-    // Connect
-    wsClient.connect();
+    // Connect (will try real API first, fall back to mock after 10s)
+    manager.connect();
 
     // Cleanup
     return () => {
-      wsClient.disconnect();
+      if (connectionManagerRef.current) {
+        connectionManagerRef.current.disconnect();
+        connectionManagerRef.current = null;
+      }
     };
-  }, [updateMarketData, setConnectionStatus, setAgentPositions]);
+  }, [
+    updateMarketData,
+    setConnectionStatus,
+    setAgentPositions,
+    setReconnectAttempt,
+    setIsFakeData,
+    setConnectionError,
+  ]);
 
   return (
     <main className="min-h-screen bg-gray-50 dark:bg-gray-900 p-4 md:p-8">
@@ -87,7 +112,7 @@ export default function Dashboard() {
               Phoenix Dashboard
             </h1>
             <p className="text-gray-600 dark:text-gray-400">
-              Real-time market data and agent positions
+              Real-time Hyperliquid market data and agent positions
             </p>
           </div>
           <ConnectionBadge />

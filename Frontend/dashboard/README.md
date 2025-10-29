@@ -84,7 +84,7 @@ npm run test:coverage
 phoenix-dashboard/
 ├── app/
 │   ├── layout.tsx          # Root layout with error boundary
-│   ├── page.tsx            # Main dashboard page
+│   ├── page.tsx            # Main dashboard page with ConnectionManager
 │   └── globals.css         # Global styles
 ├── components/
 │   ├── MarketTicker.tsx    # Market data display component
@@ -92,7 +92,9 @@ phoenix-dashboard/
 │   ├── ConnectionBadge.tsx # WebSocket connection status indicator
 │   └── ErrorBoundary.tsx   # Error boundary component
 ├── lib/
-│   ├── websocket.ts        # WebSocket client with reconnection logic
+│   ├── hyperliquid.ts      # Real Hyperliquid WebSocket client
+│   ├── connectionManager.ts # Connection manager with fallback logic
+│   ├── websocket.ts        # Mock WebSocket client (fallback)
 │   ├── math.ts             # Math utilities (P&L calculations)
 │   └── store.ts            # Zustand state management store
 ├── tests/
@@ -208,21 +210,206 @@ Zustand was chosen over alternatives because:
 - **Lazy Loading**: Components load only when needed
 - **Optimized Bundle**: Next.js automatically optimizes production bundles
 
-## Mock Data
+## Hyperliquid WebSocket Integration
 
-The dashboard currently uses a mock WebSocket client that simulates real-time market data:
+The dashboard automatically connects to the **Hyperliquid WebSocket API** for real-time market data. If the connection fails or the WebSocket schema differs, it automatically falls back to mock data after 10 seconds.
+
+### WebSocket URL
+
+```
+wss://api.hyperliquid.xyz/ws
+```
+
+### Connection Architecture
+
+The dashboard uses a **ConnectionManager** that implements a robust fallback strategy:
+
+1. **Primary Connection**: Attempts to connect to Hyperliquid WebSocket API
+2. **10-Second Timeout**: If no successful connection after 10 seconds, automatically switches to mock data
+3. **Fake Data Indicator**: Displays an orange "FAKE DATA MODE" badge when using mock data
+4. **Background Reconnection**: Continues attempting to connect to real API in the background
+5. **Automatic Switchover**: Switches back to real data when connection is restored
+
+### Subscriptions
+
+The client subscribes to the following Hyperliquid channels on connection:
+
+#### 1. All Mids (allMids)
+```typescript
+{
+  method: 'subscribe',
+  subscription: { type: 'allMids' }
+}
+```
+Provides aggregated mid-prices for all trading pairs in real-time.
+
+#### 2. Individual Coin Trades
+```typescript
+{
+  method: 'subscribe',
+  subscription: { type: 'trades', coin: 'BTC' }
+}
+{
+  method: 'subscribe',
+  subscription: { type: 'trades', coin: 'ETH' }
+}
+{
+  method: 'subscribe',
+  subscription: { type: 'trades', coin: 'SOL' }
+}
+```
+Provides detailed trade data for each coin including price, size, side, and timestamp.
+
+### Message Normalization
+
+Hyperliquid uses coin symbols like "BTC", "ETH", "SOL" while the dashboard uses "BTC-USD", "ETH-USD", "SOL-USD". The `normalizeSymbol()` function in `lib/hyperliquid.ts` automatically converts between formats.
+
+**Example Message Flow:**
+```typescript
+// Incoming from Hyperliquid
+{
+  channel: 'allMids',
+  data: {
+    'BTC': '45000.5',
+    'ETH': '2500.25',
+    'SOL': '100.75'
+  }
+}
+
+// Normalized to Dashboard Format
+{
+  symbol: 'BTC-USD',
+  price: 45000.5,
+  bid: 44978.25,  // Estimated
+  ask: 45022.75,  // Estimated
+  volume24h: 0,
+  change24h: 0,
+  timestamp: 1640000000000
+}
+```
+
+### Auto-Reconnection Strategy
+
+The Hyperliquid client implements **jittered exponential backoff** for reconnection:
+
+- **Initial Delay**: 1 second
+- **Backoff Multiplier**: 2x (1s → 2s → 4s → 8s → 16s → 30s)
+- **Maximum Delay**: 30 seconds
+- **Jitter**: Random 0-25% added to prevent thundering herd
+- **Maximum Attempts**: Unlimited (keeps retrying)
+
+**Example Reconnection Timeline:**
+```
+Attempt 1: 1.12s delay (1s + 12% jitter)
+Attempt 2: 2.43s delay (2s + 21% jitter)
+Attempt 3: 4.67s delay (4s + 17% jitter)
+Attempt 4: 8.92s delay (8s + 12% jitter)
+Attempt 5: 17.34s delay (16s + 8% jitter)
+Attempt 6: 27.56s delay (30s max + 8% jitter)
+```
+
+The reconnection count is displayed in the ConnectionBadge: "Reconnecting (3)"
+
+### Heartbeat Mechanism
+
+To detect stale connections, the client implements a heartbeat system:
+
+- **Interval**: 30 seconds
+- **Stale Threshold**: 60 seconds without messages
+- **Action**: Automatically closes and reconnects if no messages received for 60 seconds
+
+### Connection Status Badge
+
+The `ConnectionBadge` component displays real-time connection status:
+
+| Status | Color | Indicator |
+|--------|-------|-----------|
+| **Connected (Real)** | Green | Animated ping + "Connected" |
+| **Connected (Fake)** | Orange | Solid dot + "FAKE DATA MODE" |
+| **Connecting** | Yellow | Pulsing dot + "Connecting" |
+| **Reconnecting** | Yellow | Pulsing dot + "Reconnecting (n)" |
+| **Disconnected** | Red | Solid dot + "Disconnected" |
+| **Error** | Red | Solid dot + "Error" + error message |
+
+### Important Note
+
+**⚠️ If the WebSocket schema differs from the expected format, the dashboard will automatically switch to mock mode.**
+
+The connection manager will:
+1. Attempt to parse incoming messages from Hyperliquid
+2. If parsing fails or message format is unexpected, log warnings
+3. Continue attempting reconnection in the background
+4. Fall back to mock data if no successful messages after 10 seconds
+5. Display "FAKE DATA MODE" badge to indicate mock data is being used
+
+### File Structure
+
+The Hyperliquid integration is split across three files:
+
+**`lib/hyperliquid.ts`** - Real Hyperliquid WebSocket client
+- Connection management
+- Subscription handling
+- Message parsing and normalization
+- Reconnection with jittered exponential backoff
+- Heartbeat mechanism
+
+**`lib/connectionManager.ts`** - Fallback orchestration
+- Manages real vs mock client switching
+- Implements 10-second timeout
+- Handles automatic fallback to mock
+- Switches back to real when available
+
+**`lib/websocket.ts`** - Mock WebSocket client (fallback)
+- Simulates realistic market data
+- Used when real API unavailable
+- Same interface as real client
+
+### Testing the Connection
+
+**1. View Real Connection:**
+```bash
+npm run dev
+```
+Open http://localhost:3000 and look for a green "Connected" badge.
+
+**2. Simulate Connection Failure:**
+- Disconnect from internet
+- Observe yellow "Reconnecting (n)" badge
+- After 10 seconds, see orange "FAKE DATA MODE" badge
+- Reconnect to internet
+- Connection automatically switches back to green "Connected"
+
+**3. Monitor Console Logs:**
+```bash
+# Connection logs
+[Hyperliquid] Connected
+[Hyperliquid] Subscribed to allMids
+[Hyperliquid] Subscribed to trades for BTC
+[Hyperliquid] Subscribed to trades for ETH
+[Hyperliquid] Subscribed to trades for SOL
+
+# Fallback logs (if connection fails)
+[ConnectionManager] Real API failed for >10s, falling back to mock data
+[Dashboard] Switched to mock data mode
+
+# Reconnection logs
+[Hyperliquid] Reconnecting in 2431ms (attempt 2)
+[Hyperliquid] Connection closed: 1006
+```
+
+## Mock Data Fallback
+
+When the dashboard cannot connect to Hyperliquid (or after 10 seconds of failed attempts), it automatically uses mock data:
 
 - **Base Prices**: BTC-USD ($45,000), ETH-USD ($2,500), SOL-USD ($100)
 - **Volatility**: ~0.1% price fluctuation
 - **Update Frequency**: 1-2 seconds
 - **Spread**: ~0.05% of price
 - **Volume**: Random values between 500M and 1.5B
-
-To connect to a real WebSocket server, replace `createMockWebSocketClient()` with `createWebSocketClient()` in `app/page.tsx` and provide the WebSocket URL.
+- **Visual Indicator**: Orange "FAKE DATA MODE" badge
 
 ## Future Enhancements
 
-- [ ] Connect to real Hyperliquid WebSocket API
 - [ ] Add historical price charts
 - [ ] Implement order placement functionality
 - [ ] Add position management (open/close positions)

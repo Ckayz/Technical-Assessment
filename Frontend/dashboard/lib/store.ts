@@ -34,6 +34,12 @@ interface DashboardState {
   // Connection status
   connectionStatus: ConnectionStatus;
   setConnectionStatus: (status: ConnectionStatus) => void;
+  reconnectAttempt: number;
+  setReconnectAttempt: (attempt: number) => void;
+  isFakeData: boolean;
+  setIsFakeData: (isFake: boolean) => void;
+  connectionError: string | null;
+  setConnectionError: (error: string | null) => void;
 }
 
 export const useDashboardStore = create<DashboardState>((set) => ({
@@ -78,4 +84,13 @@ export const useDashboardStore = create<DashboardState>((set) => ({
   connectionStatus: 'disconnected',
   setConnectionStatus: (status: ConnectionStatus) =>
     set({ connectionStatus: status }),
+  reconnectAttempt: 0,
+  setReconnectAttempt: (attempt: number) =>
+    set({ reconnectAttempt: attempt }),
+  isFakeData: false,
+  setIsFakeData: (isFake: boolean) =>
+    set({ isFakeData: isFake }),
+  connectionError: null,
+  setConnectionError: (error: string | null) =>
+    set({ connectionError: error }),
 }));
