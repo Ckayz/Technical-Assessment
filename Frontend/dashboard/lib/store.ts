@@ -18,7 +18,9 @@ export interface AgentPosition {
   size: number;
   entryPrice: number;
   leverage: number;
+  side: 'long' | 'short';
   pnl?: number;
+  pnlPercentage?: number;
 }
 
 interface DashboardState {

@@ -15,6 +15,7 @@ const mockPositions = [
     size: 0.5,
     entryPrice: 44800,
     leverage: 10,
+    side: 'long' as const,
   },
   {
     id: '2',
@@ -22,6 +23,7 @@ const mockPositions = [
     size: 2.5,
     entryPrice: 2480,
     leverage: 5,
+    side: 'short' as const,
   },
   {
     id: '3',
@@ -29,6 +31,7 @@ const mockPositions = [
     size: 50,
     entryPrice: 99.5,
     leverage: 3,
+    side: 'long' as const,
   },
   {
     id: '4',
@@ -36,6 +39,7 @@ const mockPositions = [
     size: 0.25,
     entryPrice: 45200,
     leverage: 15,
+    side: 'short' as const,
   },
   {
     id: '5',
@@ -43,6 +47,7 @@ const mockPositions = [
     size: 5,
     entryPrice: 2510,
     leverage: 8,
+    side: 'long' as const,
   },
 ];
 
