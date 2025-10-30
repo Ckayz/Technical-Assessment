@@ -18,7 +18,7 @@ class DataTransformer:
         Normalize swap data into a pandas DataFrame.
 
         Args:
-            swaps: List of swap dictionaries from subgraph
+            swaps: List of swap dictionaries from subgraph (SwapEvent.model_dump())
 
         Returns:
             DataFrame with normalized swap data
@@ -29,8 +29,24 @@ class DataTransformer:
 
         df = pd.DataFrame(swaps)
 
+        # Handle both old field names and new SwapEvent field names
+        # New: amount0, amount1, token0, token1, txHash
+        # Old: amountIn, amountOut, tokenIn, tokenOut, transaction
+
+        # Rename SwapEvent fields to match expected format if needed
+        if "amount0" in df.columns and "amountIn" not in df.columns:
+            df["amountIn"] = df["amount0"]
+        if "amount1" in df.columns and "amountOut" not in df.columns:
+            df["amountOut"] = df["amount1"]
+        if "token0" in df.columns and "tokenIn" not in df.columns:
+            df["tokenIn"] = df["token0"]
+        if "token1" in df.columns and "tokenOut" not in df.columns:
+            df["tokenOut"] = df["token1"]
+        if "txHash" in df.columns and "transaction" not in df.columns:
+            df["transaction"] = df["txHash"]
+
         # Convert numeric fields
-        numeric_fields = ["amountIn", "amountOut", "amountInUSD", "amountOutUSD", "blockNumber"]
+        numeric_fields = ["amount0", "amount1", "amountIn", "amountOut", "amountInUSD", "amountOutUSD", "blockNumber"]
         for field in numeric_fields:
             if field in df.columns:
                 df[field] = pd.to_numeric(df[field], errors="coerce")

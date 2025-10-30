@@ -22,7 +22,7 @@ class StateManager:
         Args:
             state_file: Path to state file (defaults to settings)
         """
-        self.state_file = state_file or settings.state_file
+        self.state_file = state_file or settings.state_path
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
 
     def load_state(self) -> Dict[str, Any]:

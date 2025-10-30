@@ -1,9 +1,9 @@
 """Configuration management using Pydantic settings."""
 
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,9 +18,13 @@ class Settings(BaseSettings):
     )
 
     # Subgraph Configuration
+    # IMPORTANT: The Graph hosted service is deprecated as of June 2024.
+    # You MUST get a free API key from The Graph Studio: https://thegraph.com/studio/
+    # See SUBGRAPH_SETUP.md for detailed instructions.
+    # Format: https://gateway.thegraph.com/api/YOUR_API_KEY/subgraphs/id/SUBGRAPH_ID
     subgraph_url: HttpUrl = Field(
-        default="https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3",
-        description="Uniswap v3 mainnet subgraph GraphQL endpoint",
+        default="https://gateway.thegraph.com/api/[api-key]/subgraphs/id/HUZDsRpEVP2AvzDCyzDHtdc64dyDxx8FQjzsmqSg4H3B",
+        description="Uniswap v3 mainnet subgraph GraphQL endpoint (requires API key)",
     )
 
     # Time Window Configuration
@@ -92,6 +96,14 @@ class Settings(BaseSettings):
         description="Maximum number of retry attempts for subgraph requests",
         ge=0,
     )
+
+    @field_validator("end_block", "coingecko_api_key", mode="before")
+    @classmethod
+    def empty_str_to_none(cls, v: Any) -> Any:
+        """Convert empty strings to None for optional fields."""
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
     def __init__(self, **kwargs: object) -> None:
         """Initialize settings and create output directory if it doesn't exist."""

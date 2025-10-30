@@ -77,12 +77,22 @@ class PhoenixPipeline:
             # Write output
             self._write_output(swaps_df, agg_df)
 
-            # Update state
-            max_block = int(swaps_df["blockNumber"].max())
-            self.state_manager.update_last_processed_block(max_block)
+            # Update state (use timestamp instead of block number for time-based queries)
+            if "blockNumber" in swaps_df.columns and swaps_df["blockNumber"].notna().any():
+                max_block = int(swaps_df["blockNumber"].max())
+                self.state_manager.update_last_processed_block(max_block)
+                logger.info(f"Updated state: last processed block = {max_block}")
+            else:
+                # For time-based queries, store the latest timestamp
+                if "timestamp" in swaps_df.columns:
+                    max_timestamp = int(swaps_df["timestamp"].max().timestamp())
+                    state = self.state_manager.load_state()
+                    state["last_processed_timestamp"] = max_timestamp
+                    self.state_manager.save_state(state)
+                    logger.info(f"Updated state: last processed timestamp = {max_timestamp}")
 
             logger.info("=" * 80)
-            logger.info(f"Pipeline completed successfully. Processed up to block {max_block}")
+            logger.info(f"Pipeline completed successfully. Processed {len(swaps_df)} swaps")
             logger.info("=" * 80)
 
         except Exception as e:
@@ -98,46 +108,28 @@ class PhoenixPipeline:
         Fetch swaps from the subgraph.
 
         Args:
-            start_block: Starting block number
-            end_block: Ending block number
+            start_block: Starting block number (not used in time-based queries)
+            end_block: Ending block number (not used in time-based queries)
 
         Returns:
             DataFrame with swap data
         """
-        logger.info(f"Fetching swaps from block {start_block}")
-
-        all_swaps = []
-        skip = 0
-        batch_size = settings.batch_size
+        logger.info(f"Fetching swaps from last {settings.window_minutes} minutes")
 
         with SubgraphClient() as client:
-            # Get latest block if end_block not specified
-            if end_block is None:
-                end_block = client.get_latest_block()
-                logger.info(f"Using latest block: {end_block}")
+            # Fetch swaps using the new time-window based API
+            swaps = client.get_recent_swaps(
+                window_minutes=settings.window_minutes,
+                batch_size=settings.batch_size,
+            )
 
-            while True:
-                swaps = client.get_swaps(
-                    start_block=start_block,
-                    end_block=end_block,
-                    first=batch_size,
-                    skip=skip,
-                )
+        logger.info(f"Fetched total of {len(swaps)} swaps")
 
-                if not swaps:
-                    break
+        # Convert SwapEvent objects to list of dicts for the transformer
+        swaps_dicts = [swap.model_dump() for swap in swaps]
 
-                all_swaps.extend(swaps)
-                skip += batch_size
-
-                logger.info(f"Fetched {len(all_swaps)} total swaps so far...")
-
-                # Stop if we got fewer results than batch size
-                if len(swaps) < batch_size:
-                    break
-
-        df = self.transformer.normalize_swaps(all_swaps)
-        logger.info(f"Fetched total of {len(df)} swaps")
+        df = self.transformer.normalize_swaps(swaps_dicts)
+        logger.info(f"Normalized to {len(df)} swaps")
         return df
 
     def _transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
