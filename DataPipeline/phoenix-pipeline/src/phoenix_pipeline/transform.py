@@ -6,11 +6,206 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from phoenix_pipeline.config import EnrichedSwap, SummaryRow
+
 logger = logging.getLogger(__name__)
 
 
 class DataTransformer:
     """Transform and enrich swap data with price information."""
+
+    @staticmethod
+    def enrich_swaps(
+        swaps: List[Dict[str, Any]],
+        prices: Dict[str, float],
+    ) -> List[EnrichedSwap]:
+        """
+        Enrich swap events with USD price data and volume calculations.
+
+        Args:
+            swaps: List of swap dictionaries (from SwapEvent.model_dump())
+            prices: Dictionary mapping token addresses to USD prices
+
+        Returns:
+            List of EnrichedSwap objects with price and volume data
+
+        Notes:
+            - Skips swaps with missing prices (logs warning)
+            - Rounds decimals to 6 places for USD values
+            - Computes usdVolume = abs(amount0*price0) + abs(amount1*price1)
+            - For stablecoins, uses one side if both are stable
+            - Creates pair identifier as "TOKEN0-TOKEN1"
+            - Amounts are assumed to be in raw token units (not normalized)
+        """
+        enriched_swaps: List[EnrichedSwap] = []
+        skipped_count = 0
+
+        # Stablecoin addresses (lowercase) for detection
+        STABLECOINS = {
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+            "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+            "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI
+            "0x0000000000085d4780b73119b644ae5ecd22b376",  # TUSD
+            "0x8e870d67f660d95d5be530380d0ec0bd388289e1",  # USDP
+        }
+
+        # Token decimals mapping (lowercase addresses)
+        TOKEN_DECIMALS = {
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": 18,  # WETH
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,   # USDC
+            "0xdac17f958d2ee523a2206206994597c13d831ec7": 6,   # USDT
+            "0x6b175474e89094c44da98b954eedeac495271d0f": 18,  # DAI
+            "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": 8,   # WBTC
+            "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984": 18,  # UNI
+            "0x514910771af9ca656af840dff83e8264ecf986ca": 18,  # LINK
+            "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9": 18,  # AAVE
+            "0xd533a949740bb3306d119cc777fa900ba034cd52": 18,  # CRV
+            "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2": 18,  # MKR
+        }
+
+        for swap in swaps:
+            token0 = swap.get("token0", "").lower()
+            token1 = swap.get("token1", "").lower()
+
+            # Get prices (case-insensitive lookup)
+            price0 = None
+            price1 = None
+            for addr, price in prices.items():
+                addr_lower = addr.lower()
+                if addr_lower == token0:
+                    price0 = price
+                if addr_lower == token1:
+                    price1 = price
+
+            # Skip if missing prices
+            if price0 is None or price1 is None:
+                logger.warning(
+                    f"Skipping swap {swap.get('txHash', 'unknown')[:10]}...: "
+                    f"missing prices (token0={token0[:10]}..., token1={token1[:10]}...)"
+                )
+                skipped_count += 1
+                continue
+
+            # Convert amounts to float
+            try:
+                amount0_raw = float(swap.get("amount0", 0))
+                amount1_raw = float(swap.get("amount1", 0))
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"Skipping swap {swap.get('txHash', 'unknown')[:10]}...: "
+                    f"invalid amounts ({e})"
+                )
+                skipped_count += 1
+                continue
+
+            # Get decimals (default to 18 if unknown)
+            decimals0 = TOKEN_DECIMALS.get(token0, 18)
+            decimals1 = TOKEN_DECIMALS.get(token1, 18)
+
+            # Normalize amounts (convert from raw units to decimal)
+            amount0 = amount0_raw / (10 ** decimals0)
+            amount1 = amount1_raw / (10 ** decimals1)
+
+            # Calculate USD volume
+            # For stablecoin pairs, use one side to avoid double-counting
+            token0_is_stable = token0 in STABLECOINS
+            token1_is_stable = token1 in STABLECOINS
+
+            if token0_is_stable and token1_is_stable:
+                # Both stable: use token0 side only (should be ~equal anyway)
+                usd_volume = abs(amount0 * price0)
+            elif token0_is_stable:
+                # Token0 is stable: use token0 side (more accurate)
+                usd_volume = abs(amount0 * price0)
+            elif token1_is_stable:
+                # Token1 is stable: use token1 side (more accurate)
+                usd_volume = abs(amount1 * price1)
+            else:
+                # Neither stable: sum both sides
+                usd_volume = abs(amount0 * price0) + abs(amount1 * price1)
+
+            # Round to 6 decimal places
+            usd_volume = round(usd_volume, 6)
+            price0_rounded = round(price0, 6)
+            price1_rounded = round(price1, 6)
+
+            # Create pair identifier (token addresses)
+            pair = f"{token0}-{token1}"
+
+            # Create enriched swap
+            enriched_swap = EnrichedSwap(
+                txHash=swap["txHash"],
+                blockNumber=swap["blockNumber"],
+                timestamp=swap["timestamp"],
+                token0=swap["token0"],
+                token1=swap["token1"],
+                amount0=swap["amount0"],
+                amount1=swap["amount1"],
+                sqrtPriceX96=swap["sqrtPriceX96"],
+                priceUSD0=price0_rounded,
+                priceUSD1=price1_rounded,
+                usdVolume=usd_volume,
+                pair=pair,
+            )
+
+            enriched_swaps.append(enriched_swap)
+
+        if skipped_count > 0:
+            logger.warning(f"Skipped {skipped_count} swaps due to missing prices or invalid data")
+
+        logger.info(f"Enriched {len(enriched_swaps)} swaps with price data")
+        return enriched_swaps
+
+    @staticmethod
+    def summarize(enriched: List[EnrichedSwap], top_n: Optional[int] = None) -> pd.DataFrame:
+        """
+        Summarize enriched swaps by trading pair.
+
+        Args:
+            enriched: List of EnrichedSwap objects
+            top_n: Optional number of top pairs by USD volume to return
+
+        Returns:
+            DataFrame with columns: pair, count, totalUSD, avgUSD
+            Sorted by totalUSD descending (deterministic ordering)
+
+        Notes:
+            - Groups by pair (token0-token1)
+            - Computes count, totalUSD (sum), avgUSD (mean)
+            - Rounds avgUSD and totalUSD to 2 decimal places
+            - Sorts by totalUSD descending, then by pair ascending (for determinism)
+        """
+        if not enriched:
+            logger.warning("No enriched swaps to summarize")
+            return pd.DataFrame(columns=["pair", "count", "totalUSD", "avgUSD"])
+
+        # Convert to DataFrame for easier aggregation
+        df = pd.DataFrame([swap.model_dump() for swap in enriched])
+
+        # Group by pair and aggregate
+        summary = df.groupby("pair", as_index=False).agg(
+            count=("usdVolume", "count"),
+            totalUSD=("usdVolume", "sum"),
+            avgUSD=("usdVolume", "mean"),
+        )
+
+        # Round to 2 decimal places
+        summary["totalUSD"] = summary["totalUSD"].round(2)
+        summary["avgUSD"] = summary["avgUSD"].round(2)
+
+        # Sort by totalUSD descending, then by pair ascending (deterministic)
+        summary = summary.sort_values(
+            by=["totalUSD", "pair"],
+            ascending=[False, True],
+        ).reset_index(drop=True)
+
+        # Optionally filter to top N pairs
+        if top_n is not None and top_n > 0:
+            summary = summary.head(top_n)
+            logger.info(f"Summarized to top {top_n} pairs by USD volume")
+
+        logger.info(f"Created summary with {len(summary)} pairs")
+        return summary
 
     @staticmethod
     def normalize_swaps(swaps: List[Dict[str, Any]]) -> pd.DataFrame:

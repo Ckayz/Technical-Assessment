@@ -2,14 +2,16 @@
 
 import logging
 import sys
-from typing import Optional
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 
 from phoenix_pipeline.coingecko import CoinGeckoClient
 from phoenix_pipeline.config import settings
-from phoenix_pipeline.io import DataWriter, StateManager
-from phoenix_pipeline.subgraph import SubgraphClient
+from phoenix_pipeline.io import filter_swaps_by_block, read_state, write_csv, write_json, write_state
+from phoenix_pipeline.subgraph import SubgraphClient, build_query
 from phoenix_pipeline.transform import DataTransformer
 
 # Configure logging
@@ -26,211 +28,251 @@ class PhoenixPipeline:
 
     def __init__(self) -> None:
         """Initialize pipeline components."""
-        self.state_manager = StateManager()
-        self.data_writer = DataWriter()
         self.transformer = DataTransformer()
+        self.stats: Dict[str, Any] = {}
         logger.info("Phoenix pipeline initialized")
 
-    def run(
-        self,
-        start_block: Optional[int] = None,
-        end_block: Optional[int] = None,
-        resume: bool = True,
-    ) -> None:
+    def run(self) -> int:
         """
         Run the complete pipeline.
 
-        Args:
-            start_block: Starting block number (None to use state/config)
-            end_block: Ending block number (None for latest)
-            resume: Whether to resume from last processed block
+        Returns:
+            Exit code (0 for success, 1 for failure)
+
+        Workflow:
+            1. Load config and state
+            2. Compute time window and build GraphQL query
+            3. Fetch swaps from subgraph
+            4. Exit gracefully if no swaps
+            5. Determine latest block and filter by state
+            6. Collect unique tokens and fetch prices
+            7. Enrich swaps and create summary
+            8. Write outputs (swaps.json, summary.csv)
+            9. Update state with latest block
+            10. Print run statistics
         """
+        start_time = time.time()
+
         logger.info("=" * 80)
         logger.info("Starting Phoenix Pipeline")
         logger.info("=" * 80)
 
         try:
-            # Determine starting block
-            if resume and start_block is None:
-                start_block = self.state_manager.get_last_processed_block()
-                logger.info(f"Resuming from block {start_block}")
-            elif start_block is None:
-                start_block = settings.start_block
-                logger.info(f"Starting from configured block {start_block}")
+            # 1. Load config and state
+            logger.info("\n[1/10] Loading configuration and state...")
+            state = read_state()
+            last_processed_block = state.get("last_processed_block", 0)
+            logger.info(f"  Config: window={settings.window_minutes}min, batch_size={settings.batch_size}")
+            logger.info(f"  State: last_processed_block={last_processed_block}")
 
-            # Fetch data from subgraph
-            swaps_df = self._fetch_swaps(start_block, end_block)
+            # 2. Compute window and build query
+            logger.info("\n[2/10] Building GraphQL query...")
+            query = build_query(settings.window_minutes)
+            logger.info(f"  Query: Fetching swaps from last {settings.window_minutes} minutes")
 
-            if swaps_df.empty:
-                logger.info("No swaps to process")
-                return
+            # 3. Fetch swaps
+            logger.info("\n[3/10] Fetching swaps from subgraph...")
+            swaps = self._fetch_swaps()
 
-            # Transform and validate data
-            swaps_df = self._transform_data(swaps_df)
+            if not swaps:
+                logger.info("\n✓ No swaps found in time window - exiting gracefully")
+                self._print_stats(time.time() - start_time, swaps_fetched=0, swaps_processed=0)
+                return 0
 
-            # Enrich with price data
-            swaps_df = self._enrich_with_prices(swaps_df)
+            logger.info(f"  Fetched: {len(swaps)} swaps")
+            self.stats["swaps_fetched"] = len(swaps)
 
-            # Calculate aggregations
-            agg_df = self._calculate_aggregations(swaps_df)
+            # 4. Determine latest block and filter by state
+            logger.info("\n[4/10] Filtering swaps by state...")
+            swaps_dicts = [swap.model_dump() for swap in swaps]
 
-            # Write output
-            self._write_output(swaps_df, agg_df)
+            # Find latest block
+            blocks = [s.get("blockNumber", 0) for s in swaps_dicts if "blockNumber" in s]
+            latest_block = max(blocks) if blocks else 0
+            logger.info(f"  Latest block in results: {latest_block}")
 
-            # Update state (use timestamp instead of block number for time-based queries)
-            if "blockNumber" in swaps_df.columns and swaps_df["blockNumber"].notna().any():
-                max_block = int(swaps_df["blockNumber"].max())
-                self.state_manager.update_last_processed_block(max_block)
-                logger.info(f"Updated state: last processed block = {max_block}")
+            # Filter by last processed block
+            filtered_swaps = filter_swaps_by_block(swaps_dicts, last_processed_block)
+            self.stats["swaps_filtered"] = len(swaps_dicts) - len(filtered_swaps)
+            self.stats["swaps_new"] = len(filtered_swaps)
+
+            if not filtered_swaps:
+                logger.info("\n✓ No new swaps to process (all already processed) - exiting gracefully")
+                self._print_stats(time.time() - start_time, swaps_fetched=len(swaps), swaps_processed=0)
+                return 0
+
+            logger.info(f"  New swaps to process: {len(filtered_swaps)}")
+
+            # 5. Collect token addresses
+            logger.info("\n[5/10] Collecting unique tokens...")
+            tokens = self._collect_tokens(filtered_swaps)
+            logger.info(f"  Unique tokens: {len(tokens)}")
+            self.stats["unique_tokens"] = len(tokens)
+
+            # 6. Fetch prices
+            logger.info("\n[6/10] Fetching prices from CoinGecko...")
+            prices = self._fetch_prices(tokens)
+            logger.info(f"  Prices fetched: {len(prices)}/{len(tokens)} tokens")
+            self.stats["prices_fetched"] = len(prices)
+            self.stats["prices_missing"] = len(tokens) - len(prices)
+
+            # 7. Enrich and summarize
+            logger.info("\n[7/10] Enriching swaps with price data...")
+            enriched = self.transformer.enrich_swaps(filtered_swaps, prices)
+            logger.info(f"  Enriched: {len(enriched)} swaps")
+            self.stats["swaps_enriched"] = len(enriched)
+            self.stats["swaps_skipped"] = len(filtered_swaps) - len(enriched)
+
+            logger.info("\n[8/10] Creating summary...")
+            summary_df = self.transformer.summarize(enriched, top_n=None)
+            logger.info(f"  Summary: {len(summary_df)} trading pairs")
+            self.stats["pairs_summarized"] = len(summary_df)
+
+            # 8. Write outputs
+            logger.info("\n[9/10] Writing output files...")
+            self._write_outputs(enriched, summary_df)
+
+            # 9. Update state
+            logger.info("\n[10/10] Updating state...")
+            if latest_block > 0:
+                write_state(block=latest_block)
+                logger.info(f"  State updated: last_processed_block={latest_block}")
             else:
-                # For time-based queries, store the latest timestamp
-                if "timestamp" in swaps_df.columns:
-                    max_timestamp = int(swaps_df["timestamp"].max().timestamp())
-                    state = self.state_manager.load_state()
-                    state["last_processed_timestamp"] = max_timestamp
-                    self.state_manager.save_state(state)
-                    logger.info(f"Updated state: last processed timestamp = {max_timestamp}")
+                logger.warning("  No valid block number found, state not updated")
 
+            # 10. Print stats
+            elapsed_time = time.time() - start_time
+            logger.info("\n" + "=" * 80)
+            logger.info("Pipeline Completed Successfully!")
             logger.info("=" * 80)
-            logger.info(f"Pipeline completed successfully. Processed {len(swaps_df)} swaps")
-            logger.info("=" * 80)
+            self._print_stats(elapsed_time, swaps_fetched=len(swaps), swaps_processed=len(enriched))
 
+            return 0
+
+        except KeyboardInterrupt:
+            logger.warning("\n\nPipeline interrupted by user")
+            return 130
         except Exception as e:
-            logger.error(f"Pipeline failed with error: {e}", exc_info=True)
-            raise
+            logger.error(f"\n\nPipeline failed with error: {e}", exc_info=True)
+            return 1
 
-    def _fetch_swaps(
-        self,
-        start_block: int,
-        end_block: Optional[int],
-    ) -> pd.DataFrame:
+    def _fetch_swaps(self) -> List[Any]:
         """
         Fetch swaps from the subgraph.
 
-        Args:
-            start_block: Starting block number (not used in time-based queries)
-            end_block: Ending block number (not used in time-based queries)
-
         Returns:
-            DataFrame with swap data
+            List of SwapEvent objects
         """
-        logger.info(f"Fetching swaps from last {settings.window_minutes} minutes")
-
         with SubgraphClient() as client:
-            # Fetch swaps using the new time-window based API
             swaps = client.get_recent_swaps(
                 window_minutes=settings.window_minutes,
                 batch_size=settings.batch_size,
             )
+        return swaps
 
-        logger.info(f"Fetched total of {len(swaps)} swaps")
-
-        # Convert SwapEvent objects to list of dicts for the transformer
-        swaps_dicts = [swap.model_dump() for swap in swaps]
-
-        df = self.transformer.normalize_swaps(swaps_dicts)
-        logger.info(f"Normalized to {len(df)} swaps")
-        return df
-
-    def _transform_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _collect_tokens(self, swaps: List[Dict[str, Any]]) -> Set[str]:
         """
-        Transform and validate swap data.
+        Collect unique token addresses from swaps.
 
         Args:
-            df: Raw swap data
+            swaps: List of swap dictionaries
 
         Returns:
-            Transformed and validated DataFrame
+            Set of unique token addresses
         """
-        logger.info("Transforming and validating data")
+        tokens: Set[str] = set()
+        for swap in swaps:
+            token0 = swap.get("token0")
+            token1 = swap.get("token1")
+            if token0:
+                tokens.add(token0)
+            if token1:
+                tokens.add(token1)
+        return tokens
 
-        # Deduplicate
-        df = self.transformer.deduplicate_swaps(df)
-
-        # Validate
-        df = self.transformer.validate_data(df)
-
-        # Detect outliers
-        df = self.transformer.detect_outliers(df)
-
-        return df
-
-    def _enrich_with_prices(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _fetch_prices(self, tokens: Set[str]) -> Dict[str, float]:
         """
-        Enrich swap data with current price information.
+        Fetch USD prices for all tokens.
 
         Args:
-            df: Swap data
+            tokens: Set of token addresses
 
         Returns:
-            Enriched DataFrame
+            Dictionary mapping token address -> USD price
         """
-        logger.info("Enriching data with price information")
+        if not tokens:
+            logger.warning("No tokens to fetch prices for")
+            return {}
 
-        try:
-            # Extract unique token addresses (simplified example)
-            # In a real implementation, you'd need a mapping from contract addresses to CoinGecko IDs
-            unique_tokens = df["tokenIn"].unique()[:10]  # Limit for demo
+        with CoinGeckoClient() as client:
+            prices = client.fetch_prices(list(tokens))
 
-            # For demo purposes, using common token IDs
-            # In production, you'd need proper address -> coingecko ID mapping
-            demo_token_ids = ["bitcoin", "ethereum", "usd-coin"]
+            # Log cache stats
+            stats = client.get_cache_stats()
+            logger.info(f"  CoinGecko stats: {stats}")
+            self.stats["coingecko_cached"] = stats["cached_tokens"]
+            self.stats["coingecko_requests"] = stats["rate_limiter"]["requests_in_window"]
 
-            with CoinGeckoClient() as client:
-                prices = client.get_price(demo_token_ids)
-                df = self.transformer.enrich_with_prices(df, prices)
+        return prices
 
-        except Exception as e:
-            logger.warning(f"Failed to enrich with prices: {e}")
-            # Continue without price enrichment
-
-        return df
-
-    def _calculate_aggregations(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate aggregated metrics.
-
-        Args:
-            df: Swap data
-
-        Returns:
-            DataFrame with aggregated metrics
-        """
-        logger.info("Calculating aggregations")
-
-        agg_df = self.transformer.calculate_aggregations(df)
-        return agg_df
-
-    def _write_output(
-        self,
-        swaps_df: pd.DataFrame,
-        agg_df: pd.DataFrame,
-    ) -> None:
+    def _write_outputs(self, enriched: List[Any], summary_df: pd.DataFrame) -> None:
         """
         Write output files.
 
         Args:
-            swaps_df: Detailed swap data
-            agg_df: Aggregated metrics
+            enriched: List of EnrichedSwap objects
+            summary_df: Summary DataFrame
         """
-        logger.info("Writing output files")
+        # Ensure output directory exists
+        output_dir = settings.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+        # Write swaps as JSON
+        swaps_path = output_dir / "swaps.json"
+        swaps_data = [swap.model_dump() for swap in enriched]
+        write_json(swaps_path, swaps_data)
+        logger.info(f"  ✓ Wrote {len(swaps_data)} swaps to: {swaps_path}")
 
-        # Write detailed swaps
-        swaps_file = self.data_writer.write(
-            swaps_df,
-            f"swaps_{timestamp}",
-        )
-        logger.info(f"Wrote swaps to {swaps_file}")
+        # Write summary as CSV
+        summary_path = output_dir / "summary.csv"
+        write_csv(summary_path, summary_df)
+        logger.info(f"  ✓ Wrote {len(summary_df)} pairs to: {summary_path}")
 
-        # Write aggregations
-        if not agg_df.empty:
-            agg_file = self.data_writer.write(
-                agg_df,
-                f"aggregations_{timestamp}",
-            )
-            logger.info(f"Wrote aggregations to {agg_file}")
+        self.stats["output_swaps_file"] = str(swaps_path)
+        self.stats["output_summary_file"] = str(summary_path)
+
+    def _print_stats(self, elapsed_time: float, swaps_fetched: int, swaps_processed: int) -> None:
+        """
+        Print run statistics.
+
+        Args:
+            elapsed_time: Total elapsed time in seconds
+            swaps_fetched: Number of swaps fetched
+            swaps_processed: Number of swaps processed
+        """
+        logger.info("")
+        logger.info("Run Statistics:")
+        logger.info("-" * 80)
+        logger.info(f"  Execution Time:        {elapsed_time:.2f} seconds")
+        logger.info(f"  Swaps Fetched:         {swaps_fetched}")
+        logger.info(f"  Swaps Filtered (old):  {self.stats.get('swaps_filtered', 0)}")
+        logger.info(f"  Swaps New:             {self.stats.get('swaps_new', 0)}")
+        logger.info(f"  Swaps Enriched:        {swaps_processed}")
+        logger.info(f"  Swaps Skipped:         {self.stats.get('swaps_skipped', 0)} (missing prices)")
+        logger.info(f"  Unique Tokens:         {self.stats.get('unique_tokens', 0)}")
+        logger.info(f"  Prices Fetched:        {self.stats.get('prices_fetched', 0)}")
+        logger.info(f"  Prices Missing:        {self.stats.get('prices_missing', 0)}")
+        logger.info(f"  Trading Pairs:         {self.stats.get('pairs_summarized', 0)}")
+        logger.info(f"  CoinGecko Cached:      {self.stats.get('coingecko_cached', 0)}")
+        logger.info(f"  CoinGecko API Calls:   {self.stats.get('coingecko_requests', 0)}")
+
+        if swaps_processed > 0:
+            logger.info("")
+            logger.info("Output Files:")
+            logger.info(f"  Swaps:   {self.stats.get('output_swaps_file', 'N/A')}")
+            logger.info(f"  Summary: {self.stats.get('output_summary_file', 'N/A')}")
+
+        logger.info("-" * 80)
 
 
 def main() -> int:
@@ -242,10 +284,9 @@ def main() -> int:
     """
     try:
         pipeline = PhoenixPipeline()
-        pipeline.run()
-        return 0
+        return pipeline.run()
     except Exception as e:
-        logger.error(f"Pipeline execution failed: {e}")
+        logger.error(f"Fatal error: {e}", exc_info=True)
         return 1
 
 
