@@ -337,6 +337,4 @@ When using mock data (orange badge), the dashboard simulates:
 - **WebSocket**: Native WebSocket API
 - **Linting**: ESLint
 
-## License
 
-This project is created for demonstration purposes.
